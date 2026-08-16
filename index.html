@@ -1,0 +1,1196 @@
+<!DOCTYPE html>
+<html lang="ko"><head>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        // html-to-image is only used by takeScreenshot: fetched on first use, not as a
+        // parser-blocking tag. Native fetch, captured before the proxy override below.
+        const realFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
+        const HTML_TO_IMAGE_SRC = "https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js";
+        const HTML_TO_IMAGE_INTEGRITY = "sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==";
+        let htmlToImageLoad = null;
+        const loadHtmlToImage = () => {
+          if (!htmlToImageLoad) {
+            htmlToImageLoad = (realFetch
+              ? realFetch(HTML_TO_IMAGE_SRC, { integrity: HTML_TO_IMAGE_INTEGRITY, credentials: 'omit', referrerPolicy: 'no-referrer' })
+              : Promise.reject(new Error('fetch unavailable'))
+            )
+              .then((res) => {
+                if (!res.ok) throw new Error('html-to-image failed to load (' + res.status + ')');
+                return res.text();
+              })
+              .then((source) => {
+                // UMD bundle: hide the artifact's AMD/CommonJS globals so it takes the
+                // window-global branch; inline script text runs synchronously on insert.
+                const hidden = ['define', 'module', 'exports'].map((k) => {
+                  const entry = { k, own: Object.prototype.hasOwnProperty.call(window, k), v: window[k] };
+                  try { window[k] = undefined; } catch (e) {}
+                  return entry;
+                });
+                try {
+                  const el = document.createElement('script');
+                  el.text = source;
+                  (document.head || document.documentElement).appendChild(el);
+                } finally {
+                  hidden.forEach(({ k, own, v }) => {
+                    try { if (own) { window[k] = v; } else { delete window[k]; } } catch (e) {}
+                  });
+                }
+                if (!window.htmlToImage) throw new Error('html-to-image unavailable after load');
+                return window.htmlToImage;
+              });
+            // A failed load may be transient; let the next screenshot retry.
+            htmlToImageLoad.catch(() => { htmlToImageLoad = null; });
+          }
+          return htmlToImageLoad;
+        };
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            realParent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            realParent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            realParent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures and toPng errors so the parent always
+            // gets a response instead of hanging forever.
+            try {
+              const htmlToImage = await loadHtmlToImage();
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>점 · 나의 시작 화실</title>
+<style>
+  :root{
+    --bg:#0f1230; --bg2:#1a1f4a; --panel:#ffffff;
+    --ink:#20264d; --sub:#5b638f; --line:#e6e8f5;
+    --red:#ef5350; --orange:#ffa726; --yellow:#ffd54f;
+    --green:#66bb6a; --blue:#42a5f5; --purple:#ab47bc; --pink:#ec407a;
+    --accent:#ffca28; --shadow:0 10px 30px rgba(20,24,70,.14);
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    font-family:'Pretendard','Apple SD Gothic Neo','Malgun Gothic',system-ui,sans-serif;
+    color:var(--ink);
+    background:
+      radial-gradient(1200px 600px at 80% -10%, #2b3170 0%, transparent 60%),
+      radial-gradient(900px 500px at -10% 110%, #3a2a66 0%, transparent 55%),
+      linear-gradient(160deg,#0f1230,#1a1f4a);
+    min-height:100vh;
+  }
+  .wrap{max-width:1040px;margin:0 auto;padding:22px 18px 60px}
+
+  /* ---------- Header ---------- */
+  header.top{display:flex;align-items:center;gap:16px;color:#fff;padding:8px 4px 18px}
+  .logo-dot{
+    width:56px;height:56px;border-radius:50%;flex:none;
+    background:radial-gradient(circle at 34% 32%, #ffe08a, var(--red) 70%);
+    box-shadow:0 0 0 6px rgba(255,255,255,.12), 0 10px 24px rgba(239,83,80,.5);
+    animation:pop 4s ease-in-out infinite;
+  }
+  @keyframes pop{0%,100%{transform:scale(1)}50%{transform:scale(1.08)}}
+  header.top h1{font-size:26px;margin:0;letter-spacing:-.5px}
+  header.top p{margin:3px 0 0;color:#c7cbf0;font-size:13.5px}
+
+  /* ---------- Tabs ---------- */
+  .tabs{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px}
+  .tab{
+    flex:1;min-width:180px;cursor:pointer;border:none;text-align:left;
+    background:rgba(255,255,255,.08);color:#dfe2ff;border-radius:16px;
+    padding:14px 16px;transition:.18s;backdrop-filter:blur(6px);
+  }
+  .tab:hover{background:rgba(255,255,255,.16)}
+  .tab.active{background:#fff;color:var(--ink);box-shadow:var(--shadow)}
+  .tab .n{font-size:12px;opacity:.7;font-weight:700}
+  .tab .t{font-size:16.5px;font-weight:800;margin-top:2px;letter-spacing:-.3px}
+  .tab .d{font-size:12px;margin-top:3px;opacity:.75;line-height:1.35}
+
+  .view{display:none;animation:fade .3s ease}
+  .view.active{display:block}
+  @keyframes fade{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+
+  .card{background:var(--panel);border-radius:20px;box-shadow:var(--shadow);padding:20px}
+  .card h2{margin:0 0 4px;font-size:20px;letter-spacing:-.4px}
+  .card .lede{margin:0 0 16px;color:var(--sub);font-size:13.5px;line-height:1.5}
+
+  .toolbar{display:flex;flex-wrap:wrap;gap:10px 14px;align-items:center;margin-bottom:14px}
+  .swatches{display:flex;gap:7px}
+  .sw{width:30px;height:30px;border-radius:50%;cursor:pointer;border:3px solid #fff;box-shadow:0 0 0 1px var(--line);transition:.12s}
+  .sw:hover{transform:scale(1.12)}
+  .sw.on{outline:3px solid var(--ink);outline-offset:2px}
+  .btn{border:none;cursor:pointer;border-radius:12px;padding:10px 16px;font-size:14px;font-weight:800;transition:.15s;font-family:inherit}
+  .btn.primary{background:var(--ink);color:#fff}
+  .btn.primary:hover{background:#2c3470}
+  .btn.ghost{background:var(--line);color:var(--ink)}
+  .btn.ghost:hover{background:#dcdff0}
+  .btn:disabled{opacity:.45;cursor:not-allowed}
+  .btn.size{background:var(--line);color:var(--sub);padding:8px 14px}
+  .btn.size.on{background:var(--ink);color:#fff}
+  .btn.size .ico{display:inline-block;border-radius:50%;background:currentColor;vertical-align:middle;margin-right:6px}
+  input[type=text]{
+    font-family:inherit;font-size:14px;padding:10px 13px;border:2px solid var(--line);
+    border-radius:12px;outline:none;color:var(--ink);background:#fff
+  }
+  input[type=text]:focus{border-color:var(--accent)}
+  .hint{font-size:12.5px;color:var(--sub)}
+
+  /* ---------- Canvas (활동 1 & 2) ---------- */
+  .stage{
+    position:relative;width:100%;height:420px;border-radius:16px;overflow:hidden;
+    background:
+      linear-gradient(#fff,#fff) padding-box,
+      repeating-linear-gradient(45deg,#f4f5fb 0 12px,#eef0fa 12px 24px);
+    border:2px dashed #d7dbf0;cursor:crosshair;user-select:none;touch-action:none;
+  }
+  .stage .placeholder{
+    position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
+    color:#aab0d8;font-size:15px;gap:8px;pointer-events:none;text-align:center;padding:20px
+  }
+  .mark{position:absolute;transform:translate(-50%,-50%);pointer-events:none;
+    display:flex;align-items:center;justify-content:center;font-size:0}
+  @keyframes drop{0%{transform:translate(-50%,-50%) scale(0)}60%{transform:translate(-50%,-50%) scale(1.25)}100%{transform:translate(-50%,-50%) scale(1)}}
+  @keyframes morph{0%{transform:translate(-50%,-50%) scale(1) rotate(0)}50%{transform:translate(-50%,-50%) scale(.2) rotate(90deg)}100%{transform:translate(-50%,-50%) scale(1) rotate(0)}}
+  .drop{animation:drop .35s cubic-bezier(.34,1.56,.64,1)}
+  .morph{animation:morph .5s ease}
+
+  .signbar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-top:14px}
+  .count-pill{background:var(--line);border-radius:999px;padding:6px 14px;font-size:13px;font-weight:800;color:var(--sub)}
+
+  /* ---------- Gallery ---------- */
+  .gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:14px;margin-top:18px}
+  .frame{
+    background:linear-gradient(145deg,#f6d998,#e8b45e);padding:10px;border-radius:8px;
+    box-shadow:var(--shadow);animation:fade .4s ease
+  }
+  .frame .art{position:relative;height:120px;border-radius:4px;overflow:hidden;
+    background:repeating-linear-gradient(45deg,#fbfbff 0 10px,#f2f3fb 10px 20px);border:1px solid #d9c48f}
+  .frame .plate{margin-top:8px;background:#3a2f1a;color:#ffe6ad;border-radius:4px;
+    padding:5px 8px;text-align:center;font-size:12px;font-weight:700}
+  .frame .plate small{display:block;color:#cdb27a;font-weight:500;font-size:10.5px;margin-top:1px}
+  .empty-note{color:var(--sub);font-size:13px;padding:18px;text-align:center;
+    border:2px dashed var(--line);border-radius:14px;margin-top:16px}
+
+  /* ---------- Mission (활동 2) ---------- */
+  .mission{
+    display:flex;align-items:center;gap:14px;background:linear-gradient(135deg,#fff6e0,#ffe9c7);
+    border:2px solid #ffdea0;border-radius:16px;padding:14px 16px;margin-bottom:14px
+  }
+  .mission .badge{width:44px;height:44px;border-radius:12px;background:var(--accent);color:#4a3200;
+    display:flex;align-items:center;justify-content:center;font-weight:900;font-size:18px;flex:none}
+  .mission .mtext{flex:1}
+  .mission .mtext b{font-size:16px}
+  .mission .mtext .sub{font-size:12.5px;color:#9a7b3d;margin-top:2px}
+  .progress{height:10px;background:#efe2c4;border-radius:999px;overflow:hidden;margin-top:8px}
+  .progress > i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--orange),var(--yellow));transition:width .3s}
+  .visitors{display:flex;gap:12px;flex-wrap:wrap;margin-top:14px;min-height:10px}
+  .visitor{background:#eef1ff;border-radius:14px;padding:8px 12px;font-size:13px;display:flex;gap:8px;align-items:center;
+    animation:fade .4s ease;max-width:280px}
+  .visitor .face{font-size:22px}
+  .celebrate{text-align:center;padding:18px;border-radius:16px;margin-top:14px;
+    background:linear-gradient(135deg,#fff0f6,#e7f0ff);border:2px solid #ffd0e4;display:none}
+  .celebrate.show{display:block;animation:fade .5s ease}
+  .celebrate h3{margin:0 0 4px;font-size:20px}
+
+  /* ---------- Constellation (활동 3) ---------- */
+  .sky{
+    position:relative;width:100%;height:440px;border-radius:16px;overflow:hidden;cursor:default;
+    background:radial-gradient(1000px 500px at 70% -20%,#2a2f66,transparent),
+      radial-gradient(700px 500px at 10% 120%,#3b2a5e,transparent),
+      linear-gradient(180deg,#0b0e28,#161a45)
+  }
+  .sky .twinkle{position:absolute;width:2px;height:2px;background:#fff;border-radius:50%;opacity:.5}
+  .starpt{position:absolute;transform:translate(-50%,-50%);cursor:default}
+  .starpt .glow{width:20px;height:20px;border-radius:50%;
+    background:radial-gradient(circle,#fff 0%,var(--accent) 45%,transparent 72%);
+    box-shadow:0 0 16px var(--accent);animation:tw 2.6s ease-in-out infinite}
+  @keyframes tw{0%,100%{transform:scale(1);opacity:.9}50%{transform:scale(1.35);opacity:1}}
+  .starpt .lbl{position:absolute;left:24px;top:50%;transform:translateY(-50%);white-space:nowrap;
+    color:#eef;font-size:12px;background:rgba(10,14,40,.6);padding:3px 9px;border-radius:999px;
+    border:1px solid rgba(255,255,255,.15);max-width:220px;overflow:hidden;text-overflow:ellipsis}
+  .starpt.filler .glow{width:11px;height:11px;box-shadow:0 0 9px rgba(255,202,40,.7);opacity:.85}
+  .starpt{transition:left .7s cubic-bezier(.4,0,.2,1), top .7s cubic-bezier(.4,0,.2,1)}
+  #lines line{transition:opacity .4s}
+  .shapebar{display:flex;flex-wrap:wrap;gap:9px;align-items:center;margin-bottom:12px;
+    background:#f6f7fd;border:1px solid var(--line);border-radius:14px;padding:11px 13px}
+  .chips{display:flex;gap:6px;flex-wrap:wrap}
+  .chip{cursor:pointer;border:2px solid var(--line);background:#fff;border-radius:999px;
+    padding:6px 12px;font-size:13px;font-weight:700;color:var(--ink);transition:.12s;font-family:inherit}
+  .chip:hover{border-color:var(--accent)}
+  .chip.on{background:var(--ink);color:#fff;border-color:var(--ink)}
+  .shape-tag{position:absolute;top:12px;left:14px;color:#ffe6ad;font-size:14px;font-weight:800;
+    background:rgba(10,14,40,.55);padding:5px 12px;border-radius:999px;display:none}
+  .shape-tag.show{display:block;animation:fade .4s ease}
+  .sky .sky-empty{position:absolute;inset:0;display:flex;flex-direction:column;gap:8px;
+    align-items:center;justify-content:center;color:#8b91c8;font-size:15px;text-align:center;padding:24px}
+  .courage-log{margin-top:16px;display:flex;flex-direction:column;gap:8px}
+  .courage-log .row{display:flex;gap:10px;align-items:flex-start;background:#f6f7fd;border-radius:12px;padding:10px 13px;font-size:13.5px}
+  .courage-log .row .num{width:24px;height:24px;border-radius:50%;background:var(--accent);color:#4a3200;
+    display:flex;align-items:center;justify-content:center;font-weight:900;font-size:12px;flex:none}
+
+  footer{color:#aeb3e0;text-align:center;font-size:12px;margin-top:30px;line-height:1.6}
+  .toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%) translateY(20px);
+    background:var(--ink);color:#fff;padding:12px 20px;border-radius:14px;font-weight:700;font-size:14px;
+    box-shadow:var(--shadow);opacity:0;transition:.3s;z-index:50;pointer-events:none}
+  .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+  @media (max-width:560px){
+    .stage,.sky{height:340px}
+    header.top h1{font-size:21px}
+    .tab{min-width:calc(50% - 5px)}
+  }
+
+  /* ---------- Copy-source button & modal (GitHub 업로드용) ---------- */
+  .copy-fab{
+    position:fixed;top:16px;right:16px;z-index:80;
+    display:flex;align-items:center;gap:7px;cursor:pointer;
+    background:rgba(255,255,255,.95);color:var(--ink);border:none;
+    padding:10px 16px;border-radius:999px;font-family:inherit;font-size:13px;font-weight:800;
+    box-shadow:var(--shadow);transition:.15s;
+  }
+  .copy-fab:hover{transform:translateY(-1px);background:#fff}
+  .copy-fab:active{transform:translateY(0)}
+  .copy-fab .ic{font-size:15px}
+  .modal-overlay{
+    display:none;position:fixed;inset:0;background:rgba(10,12,36,.6);z-index:100;
+    align-items:center;justify-content:center;padding:20px;
+  }
+  .modal-overlay.show{display:flex}
+  .modal-box{
+    background:#fff;border-radius:18px;box-shadow:var(--shadow);max-width:640px;width:100%;
+    padding:20px;max-height:82vh;display:flex;flex-direction:column;gap:12px;
+  }
+  .modal-box h3{margin:0;font-size:17px}
+  .modal-box p{margin:0;color:var(--sub);font-size:13px;line-height:1.5}
+  .modal-box textarea{
+    width:100%;flex:1;min-height:260px;resize:vertical;font-family:'SFMono-Regular',Consolas,Menlo,monospace;
+    font-size:11.5px;line-height:1.5;color:var(--ink);border:2px solid var(--line);border-radius:12px;
+    padding:12px;outline:none;
+  }
+  .modal-box textarea:focus{border-color:var(--accent)}
+  .modal-actions{display:flex;justify-content:flex-end;gap:8px}
+  @media (max-width:560px){
+    .copy-fab{top:10px;right:10px;padding:9px 13px;font-size:12px}
+  }
+</style>
+</head>
+<body id="artifacts-component-root-html">
+<button class="copy-fab" id="copySourceBtn" type="button">
+  <span class="ic">📋</span><span id="copyBtnLabel">코드 전체 복사</span>
+</button>
+<div class="modal-overlay" id="copyModal">
+  <div class="modal-box">
+    <h3>코드를 자동으로 복사하지 못했어요</h3>
+    <p>아래 상자를 눌러 <b>전체 선택</b> 버튼을 누른 뒤, <kbd>Ctrl/Cmd + C</kbd>로 직접 복사해서 GitHub에 붙여넣어 주세요.</p>
+    <textarea id="sourceTextarea" readonly=""></textarea>
+    <div class="modal-actions">
+      <button class="btn ghost" id="selectAllBtn">전체 선택</button>
+      <button class="btn primary" id="closeModalBtn">닫기</button>
+    </div>
+  </div>
+</div>
+<div class="wrap">
+  <header class="top">
+    <div class="logo-dot"></div>
+    <div>
+      <h1>점 · 나의 시작 화실</h1>
+      <p>그림책 《점》으로 배우는 시작할 용기와 나만의 표현 · 5~6학년용</p>
+    </div>
+  </header>
+
+  <div class="tabs">
+    <button class="tab active" data-view="v1">
+      <div class="n">활동 ①</div>
+      <div class="t">점 하나로 시작하기</div>
+      <div class="d">톡 누르면 점이 별·꽃·얼굴로 변신! 서명해서 갤러리에 걸기</div>
+    </button>
+    <button class="tab" data-view="v2">
+      <div class="n">활동 ②</div>
+      <div class="t">베티의 점 전시회 챌린지</div>
+      <div class="d">미션을 하나씩 깨서 벽을 채우면 전시회가 열려요</div>
+    </button>
+    <button class="tab" data-view="v3">
+      <div class="n">활동 ③</div>
+      <div class="t">용기 점 별자리</div>
+      <div class="d">용기 낸 일을 적을 때마다 별이 이어져 나만의 별자리로</div>
+    </button>
+  </div>
+
+  <!-- ================= 활동 1 ================= -->
+  <section id="v1" class="view active">
+    <div class="card">
+      <h2>① 점 하나로 시작하기 캔버스</h2>
+      <p class="lede">"그냥 점 하나 찍어 봐." 빈 화면을 톡 누르면 점이 찍히고, 그 점이 <b>깜짝 변신</b>해서 별·꽃·웃는 얼굴이 됩니다.
+        마음에 드는 그림이 완성되면 <b>이름을 서명</b>하고 액자에 담아 나만의 갤러리에 걸어 보세요.</p>
+
+      <div class="toolbar">
+        <span class="hint">색 고르기</span>
+        <div class="swatches" id="sw1"></div>
+        <button class="btn ghost" id="clear1">화면 지우기</button>
+        <span class="count-pill" id="cnt1">찍은 점 0개</span>
+      </div>
+
+      <div class="stage" id="stage1">
+        <div class="placeholder" id="ph1">🎨 여기를 톡! 눌러 첫 점을 찍어 보세요<br><small>점이 무엇으로 변신할지 아무도 몰라요</small></div>
+      </div>
+
+      <div class="signbar">
+        <input type="text" id="sign1" placeholder="여기에 내 이름을 서명하세요" maxlength="12">
+        <button class="btn primary" id="frameBtn">🖼️ 액자에 걸기</button>
+        <span class="hint">완성된 그림이 아래 갤러리에 이름표와 함께 걸립니다.</span>
+      </div>
+
+      <div id="gallery1"></div>
+    </div>
+  </section>
+
+  <!-- ================= 활동 2 ================= -->
+  <section id="v2" class="view">
+    <div class="card">
+      <h2>② 베티의 점 전시회 챌린지</h2>
+      <p class="lede">미션이 하나씩 주어져요. 조건에 맞는 점을 찍어 미션을 모두 깨면, 관람객들이 몰려와 감탄하며 <b>나만의 전시회</b>가 열립니다!</p>
+
+      <div class="mission">
+        <div class="badge" id="mBadge">1</div>
+        <div class="mtext">
+          <b id="mTitle">미션을 불러오는 중…</b>
+          <div class="sub" id="mSub"></div>
+          <div class="progress"><i id="mBar"></i></div>
+        </div>
+      </div>
+
+      <div class="toolbar">
+        <span class="hint">지금 찍을 색</span>
+        <div class="swatches" id="sw2"></div>
+        <span class="hint">·</span>
+        <span class="hint">점 크기</span>
+        <button class="btn size on" id="sizeSmall"><span class="ico" style="width:9px;height:9px"></span>작게</button>
+        <button class="btn size" id="sizeBig"><span class="ico" style="width:16px;height:16px"></span>크게</button>
+      </div>
+
+      <div class="stage" id="stage2">
+        <div class="placeholder" id="ph2">🖐️ 미션에 맞는 점을 이 벽에 찍어 보세요</div>
+      </div>
+
+      <div class="visitors" id="visitors"></div>
+
+      <div class="celebrate" id="celebrate">
+        <h3>🎉 전시회가 열렸습니다! 🎉</h3>
+        <p style="margin:0;color:var(--sub)">베티처럼 용기 내서 시작한 네 작품이 모두를 감탄하게 만들었어요.</p>
+        <button class="btn primary" id="again2" style="margin-top:12px">다시 도전하기</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 활동 3 ================= -->
+  <section id="v3" class="view">
+    <div class="card">
+      <h2>③ 용기 점 별자리</h2>
+      <p class="lede">'오늘 용기 내서 시작한 일'을 하나씩 적으면 밤하늘에 별이 떠올라요.
+        별을 <b>3개 이상</b> 모은 뒤 <b>원하는 모양</b>을 고르거나 직접 적으면, 별들이 이어져 그 그림 모양의 <b>나만의 별자리</b>가 됩니다.</p>
+
+      <div class="signbar" style="margin-top:0;margin-bottom:12px">
+        <input type="text" id="courageInput" placeholder="예: 손 들고 발표했다 / 새 친구에게 먼저 말 걸었다" maxlength="40" style="flex:1;min-width:240px">
+        <button class="btn primary" id="addStar">✨ 별 하나 띄우기</button>
+      </div>
+
+      <div class="shapebar">
+        <span class="hint">✏️ 만들 별자리 모양:</span>
+        <div class="chips" id="shapeChips"></div>
+        <input type="text" id="shapeInput" placeholder="직접 입력 (하트·별·물고기·집·나무·왕관·달·동그라미)" maxlength="10" style="min-width:200px">
+        <button class="btn primary" id="makeShape">🌟 별자리 만들기</button>
+        <button class="btn ghost" id="scatterSky">흩뿌리기</button>
+      </div>
+
+      <div class="sky" id="sky">
+        <svg id="lines" width="100%" height="100%" style="position:absolute;inset:0;pointer-events:none"></svg>
+        <div class="sky-empty" id="skyEmpty">🌙 아직 별이 없어요<br><small>용기 낸 일을 적으면 첫 별이 떠올라요</small></div>
+        <div class="shape-tag" id="shapeTag"></div>
+      </div>
+
+      <div class="count-pill" id="cnt3" style="margin-top:14px;display:inline-block">모은 용기 별 0개</div>
+      <div class="courage-log" id="log3"></div>
+    </div>
+  </section>
+
+  <footer>
+    그림책 《점》(피터 레이놀즈) 기반 학습 웹앱 · 서울송정초등학교<br>
+    작은 점 하나가 큰 그림의 시작입니다. 오늘도 용기 내서 점 하나!
+  </footer>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+/* ============ 코드 전체 복사 (GitHub 업로드용) ============ */
+/* 이 스크립트가 실행되기 시작하는 시점 = 사용자가 아직 아무 것도 그리지 않은
+   '원본 소스' 상태이므로, 지금 바로 문서 전체를 스냅샷으로 떠 둔다. */
+(function(){
+  var PRISTINE_HTML = '<!DOCTYPE html>\n' + document.documentElement.outerHTML;
+  var btn = document.getElementById('copySourceBtn');
+  var label = document.getElementById('copyBtnLabel');
+  var modal = document.getElementById('copyModal');
+  var ta = document.getElementById('sourceTextarea');
+
+  function flashSuccess(){
+    var old = label.textContent;
+    label.textContent = '복사 완료! ✅';
+    setTimeout(function(){ label.textContent = old; }, 1800);
+  }
+  function legacyCopy(text){
+    var t = document.createElement('textarea');
+    t.value = text;
+    t.style.position = 'fixed'; t.style.opacity = '0';
+    document.body.appendChild(t);
+    t.focus(); t.select();
+    var ok = false;
+    try { ok = document.execCommand('copy'); } catch(e){ ok = false; }
+    document.body.removeChild(t);
+    return ok;
+  }
+  function openModal(){
+    ta.value = PRISTINE_HTML;
+    modal.classList.add('show');
+  }
+  btn.addEventListener('click', function(){
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(PRISTINE_HTML).then(flashSuccess, function(){
+        if (legacyCopy(PRISTINE_HTML)) flashSuccess(); else openModal();
+      });
+    } else if (legacyCopy(PRISTINE_HTML)) {
+      flashSuccess();
+    } else {
+      openModal();
+    }
+  });
+  document.getElementById('selectAllBtn').onclick = function(){ ta.focus(); ta.select(); };
+  document.getElementById('closeModalBtn').onclick = function(){ modal.classList.remove('show'); };
+  modal.addEventListener('click', function(e){ if (e.target === modal) modal.classList.remove('show'); });
+})();
+
+/* ============ 공통 ============ */
+const PALETTE = [
+  {name:'빨강',c:'#ef5350'},{name:'주황',c:'#ffa726'},{name:'노랑',c:'#ffd54f'},
+  {name:'초록',c:'#66bb6a'},{name:'파랑',c:'#42a5f5'},{name:'보라',c:'#ab47bc'},{name:'분홍',c:'#ec407a'}
+];
+function toast(msg){
+  const t=document.getElementById('toast'); t.textContent=msg; t.classList.add('show');
+  clearTimeout(t._h); t._h=setTimeout(()=>t.classList.remove('show'),1700);
+}
+// 재현 가능한 의사난수 대신 안전한 랜덤 (Math.random 사용 가능: 브라우저 환경)
+function rand(n){return Math.floor(Math.random()*n);}
+function pick(arr){return arr[rand(arr.length)];}
+
+/* 점을 그리는 SVG 모양 생성 (별/꽃/얼굴/그냥 점) */
+function shapeSVG(kind,color,size){
+  const s=size;
+  if(kind==='dot'){
+    return `<svg width="${s}" height="${s}" viewBox="0 0 100 100"><circle cx="50" cy="50" r="46" fill="${color}"/></svg>`;
+  }
+  if(kind==='star'){
+    return `<svg width="${s}" height="${s}" viewBox="0 0 100 100"><polygon points="50,5 61,38 96,38 68,59 79,93 50,72 21,93 32,59 4,38 39,38" fill="${color}"/></svg>`;
+  }
+  if(kind==='flower'){
+    let petals='';
+    for(let i=0;i<6;i++){const a=i*60*Math.PI/180;const x=50+26*Math.cos(a),y=50+26*Math.sin(a);
+      petals+=`<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="19" fill="${color}"/>`;}
+    return `<svg width="${s}" height="${s}" viewBox="0 0 100 100">${petals}<circle cx="50" cy="50" r="15" fill="#fff3c4"/></svg>`;
+  }
+  // face
+  return `<svg width="${s}" height="${s}" viewBox="0 0 100 100">
+    <circle cx="50" cy="50" r="46" fill="${color}"/>
+    <circle cx="36" cy="42" r="7" fill="#20264d"/><circle cx="64" cy="42" r="7" fill="#20264d"/>
+    <path d="M32 62 Q50 82 68 62" stroke="#20264d" stroke-width="7" fill="none" stroke-linecap="round"/>
+  </svg>`;
+}
+function buildSwatches(container,onPick){
+  const el=document.getElementById(container);
+  PALETTE.forEach((p,i)=>{
+    const b=document.createElement('div'); b.className='sw'+(i===0?' on':'');
+    b.style.background=p.c; b.title=p.name;
+    b.onclick=()=>{[...el.children].forEach(c=>c.classList.remove('on'));b.classList.add('on');onPick(p.c);};
+    el.appendChild(b);
+  });
+}
+
+/* ============ 탭 전환 ============ */
+document.querySelectorAll('.tab').forEach(tab=>{
+  tab.onclick=()=>{
+    document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+    document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));
+    tab.classList.add('active');
+    document.getElementById(tab.dataset.view).classList.add('active');
+  };
+});
+
+/* ================= 활동 1 ================= */
+(function(){
+  let color=PALETTE[0].c, count=0;
+  const stage=document.getElementById('stage1'), ph=document.getElementById('ph1');
+  buildSwatches('sw1',c=>color=c);
+
+  function place(x,y){
+    ph.style.display='none';
+    const size=42+rand(26);
+    const m=document.createElement('div');
+    m.className='mark drop'; m.style.left=x+'px'; m.style.top=y+'px';
+    m.innerHTML=shapeSVG('dot',color,size);
+    stage.appendChild(m);
+    count++; document.getElementById('cnt1').textContent='찍은 점 '+count+'개';
+    // 깜짝 변신
+    setTimeout(()=>{
+      const kind=pick(['star','flower','face','dot','star','flower']);
+      m.classList.remove('drop'); m.classList.add('morph');
+      m.innerHTML=shapeSVG(kind,color,size+6);
+    },380);
+  }
+  function pos(e){
+    const r=stage.getBoundingClientRect();
+    const px=(e.touches?e.touches[0].clientX:e.clientX)-r.left;
+    const py=(e.touches?e.touches[0].clientY:e.clientY)-r.top;
+    return {x:Math.max(24,Math.min(r.width-24,px)),y:Math.max(24,Math.min(r.height-24,py))};
+  }
+  stage.addEventListener('click',e=>{const p=pos(e);place(p.x,p.y);});
+
+  document.getElementById('clear1').onclick=()=>{
+    [...stage.querySelectorAll('.mark')].forEach(m=>m.remove());
+    ph.style.display='flex'; count=0; document.getElementById('cnt1').textContent='찍은 점 0개';
+  };
+
+  document.getElementById('frameBtn').onclick=()=>{
+    const name=document.getElementById('sign1').value.trim();
+    if(count===0){toast('먼저 점을 하나 찍어 주세요!');return;}
+    if(!name){toast('작품에 이름을 서명해 주세요 ✍️');return;}
+    const gal=ensureGallery();
+    const frame=document.createElement('div'); frame.className='frame';
+    const art=document.createElement('div'); art.className='art';
+    // 캔버스 내용을 축소 복제
+    stage.querySelectorAll('.mark').forEach(m=>{
+      const r=stage.getBoundingClientRect();
+      const c=m.cloneNode(true); c.className='mark';
+      c.style.left=(parseFloat(m.style.left)/r.width*100)+'%';
+      c.style.top=(parseFloat(m.style.top)/r.height*100)+'%';
+      const svg=c.querySelector('svg'); const sz=parseFloat(svg.getAttribute('width'))*0.32;
+      svg.setAttribute('width',sz); svg.setAttribute('height',sz);
+      art.appendChild(c);
+    });
+    const today=new Date().toLocaleDateString('ko-KR',{month:'long',day:'numeric'});
+    const plate=document.createElement('div'); plate.className='plate';
+    plate.innerHTML=`${escapeHtml(name)}의 작품<small>${today} · 나의 첫 점</small>`;
+    frame.appendChild(art);
+    frame.appendChild(plate);
+    gal.prepend(frame);
+    toast('🖼️ 갤러리에 걸었어요! 멋진 작품이에요');
+  };
+
+  function ensureGallery(){
+    let g=document.querySelector('#gallery1 .gallery');
+    if(!g){
+      const host=document.getElementById('gallery1');
+      host.innerHTML='<h2 style="font-size:16px;margin:20px 0 0">🖼️ 우리 반 갤러리</h2><div class="gallery"></div>';
+      g=host.querySelector('.gallery');
+    }
+    return g;
+  }
+})();
+function escapeHtml(s){return s.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+
+/* ================= 활동 2 ================= */
+(function(){
+  const stage=document.getElementById('stage2'), ph=document.getElementById('ph2');
+  let color=PALETTE[0].c, big=false;
+  const MISSIONS=[
+    {title:'빨간 큰 점 1개를 찍어 보세요',   sub:'색은 빨강, 크기는 크게!', need:1, setBig:true,  test:m=>m.color==='#ef5350'&&m.big},
+    {title:'작은 점 10개를 찍어 보세요',      sub:'색은 자유! 크기는 작게', need:10, setBig:false, test:m=>!m.big},
+    {title:'노란 점 3개를 찍어 보세요',       sub:'따뜻한 노랑으로', need:3, test:m=>m.color==='#ffd54f'},
+    {title:'파란 점과 초록 점을 섞어 5개',    sub:'시원한 색으로 5개', need:5, test:m=>m.color==='#42a5f5'||m.color==='#66bb6a'},
+    {title:'아무 색이나 큰 점 4개로 마무리',  sub:'마지막! 크게 크게', need:4, setBig:true, test:m=>m.big}
+  ];
+  const VISITORS=[
+    {face:'🐟',say:'우아, 이 점 좀 봐! 정말 멋지다!'},
+    {face:'👧',say:'나도 이런 그림 그리고 싶어요.'},
+    {face:'🐠',say:'색이 정말 예뻐서 눈을 뗄 수 없어!'},
+    {face:'👦',say:'작가님, 사인 좀 해 주세요!'},
+    {face:'🐡',say:'이 전시회 최고예요. 감동이야!'}
+  ];
+  let idx=0, hit=0;
+  buildSwatches('sw2',c=>color=c);
+  const bSmall=document.getElementById('sizeSmall'), bBig=document.getElementById('sizeBig');
+  function setSize(v){big=v; bSmall.classList.toggle('on',!v); bBig.classList.toggle('on',v);}
+  bSmall.onclick=()=>setSize(false);
+  bBig.onclick=()=>setSize(true);
+  setSize(false);
+
+  function loadMission(){
+    if(idx>=MISSIONS.length){finish();return;}
+    const m=MISSIONS[idx]; hit=0;
+    if(typeof m.setBig==='boolean') setSize(m.setBig); // 미션에 맞는 크기를 자동으로 맞춰 줌
+    document.getElementById('mBadge').textContent=idx+1;
+    document.getElementById('mTitle').textContent=m.title;
+    document.getElementById('mSub').textContent=m.sub+`  (0/${m.need})`;
+    document.getElementById('mBar').style.width='0%';
+  }
+  function pos(e){
+    const r=stage.getBoundingClientRect();
+    const px=(e.touches?e.touches[0].clientX:e.clientX)-r.left;
+    const py=(e.touches?e.touches[0].clientY:e.clientY)-r.top;
+    return {x:Math.max(24,Math.min(r.width-24,px)),y:Math.max(24,Math.min(r.height-24,py))};
+  }
+  stage.addEventListener('click',e=>{
+    if(idx>=MISSIONS.length)return;
+    const p=pos(e); ph.style.display='none';
+    const size=big?64:30;
+    const el=document.createElement('div'); el.className='mark drop';
+    el.style.left=p.x+'px'; el.style.top=p.y+'px';
+    el.innerHTML=shapeSVG(pick(['dot','star','flower']),color,size);
+    stage.appendChild(el);
+    const mk={color,big};
+    const cur=MISSIONS[idx];
+    if(cur.test(mk)){
+      hit++;
+      document.getElementById('mSub').textContent=cur.sub+`  (${Math.min(hit,cur.need)}/${cur.need})`;
+      document.getElementById('mBar').style.width=Math.min(100,hit/cur.need*100)+'%';
+      if(hit>=cur.need){
+        addVisitor(); toast('미션 성공! 다음 미션으로 →');
+        idx++; setTimeout(loadMission,700);
+      }
+    }
+  });
+  function addVisitor(){
+    const v=pick(VISITORS);
+    const box=document.getElementById('visitors');
+    const el=document.createElement('div'); el.className='visitor';
+    el.innerHTML=`<span class="face">${v.face}</span><span>${v.say}</span>`;
+    box.appendChild(el);
+  }
+  function finish(){
+    document.getElementById('mTitle').textContent='모든 미션 완료! 🎊';
+    document.getElementById('mSub').textContent='관람객들이 네 작품에 감탄하고 있어요';
+    document.getElementById('mBar').style.width='100%';
+    document.getElementById('celebrate').classList.add('show');
+  }
+  document.getElementById('again2').onclick=()=>{
+    [...stage.querySelectorAll('.mark')].forEach(m=>m.remove());
+    document.getElementById('visitors').innerHTML='';
+    document.getElementById('celebrate').classList.remove('show');
+    ph.style.display='flex'; idx=0; loadMission();
+  };
+  loadMission();
+})();
+
+/* ================= 활동 3 ================= */
+(function(){
+  const sky=document.getElementById('sky'), svg=document.getElementById('lines');
+  const chipHost=document.getElementById('shapeChips');
+  const entries=[];      // {text, fx, fy}
+  const els=[];          // 별 DOM 요소 풀 (재사용해서 부드럽게 이동)
+  let shapeKey=null, token=0;
+
+  // 배경 잔별
+  for(let i=0;i<60;i++){
+    const t=document.createElement('div'); t.className='twinkle';
+    t.style.left=(5+Math.random()*90)+'%'; t.style.top=(5+Math.random()*90)+'%';
+    t.style.opacity=(0.2+Math.random()*0.6).toFixed(2);
+    sky.appendChild(t);
+  }
+
+  /* ----- 별자리 모양 정의 (y는 아래 방향, 크기는 자유) ----- */
+  const heart=[]; for(let i=0;i<28;i++){const t=Math.PI-(i/28)*2*Math.PI;
+    heart.push([16*Math.pow(Math.sin(t),3), -(13*Math.cos(t)-5*Math.cos(2*t)-2*Math.cos(3*t)-Math.cos(4*t))]);}
+  const star5=[]; for(let i=0;i<10;i++){const a=-Math.PI/2+i*Math.PI/5; const R=(i%2===0)?1:0.42;
+    star5.push([Math.cos(a)*R, Math.sin(a)*R]);}
+  const circle=[]; for(let i=0;i<24;i++){const a=i/24*2*Math.PI; circle.push([Math.cos(a),Math.sin(a)]);}
+  const SHAPES={
+    하트:{label:'하트',emoji:'❤️',res:28,pts:heart, aliases:['하트','heart','사랑','러브','love']},
+    별:  {label:'별', emoji:'⭐',res:20,pts:star5, aliases:['별','star','스타']},
+    물고기:{label:'물고기',emoji:'🐟',res:22,pts:[[.98,.5],[.78,.28],[.5,.22],[.28,.3],[.1,.12],[.2,.5],[.1,.88],[.28,.7],[.5,.78],[.78,.72]], aliases:['물고기','fish','생선','고기']},
+    집:  {label:'집', emoji:'🏠',res:16,pts:[[.2,.95],[.2,.42],[.5,.12],[.8,.42],[.8,.95]], aliases:['집','house','home','하우스']},
+    나무:{label:'나무',emoji:'🌲',res:22,pts:[[.5,.08],[.68,.42],[.57,.42],[.75,.66],[.6,.66],[.58,.92],[.42,.92],[.4,.66],[.25,.66],[.43,.42],[.32,.42]], aliases:['나무','tree','트리']},
+    왕관:{label:'왕관',emoji:'👑',res:16,pts:[[.14,.82],[.14,.4],[.3,.6],[.5,.24],[.7,.6],[.86,.4],[.86,.82]], aliases:['왕관','crown','크라운']},
+    달:  {label:'달', emoji:'🌙',res:24,pts:[[.5,-1],[-.2,-.85],[-.7,-.45],[-.9,0],[-.7,.45],[-.2,.85],[.5,1],[-.05,.6],[-.35,0],[-.05,-.6]], aliases:['달','moon','초승달','문']},
+    동그라미:{label:'동그라미',emoji:'⚪',res:24,pts:circle, aliases:['동그라미','원','circle','공','볼']}
+  };
+  // 칩 생성
+  Object.keys(SHAPES).forEach(key=>{
+    const s=SHAPES[key];
+    const c=document.createElement('button'); c.className='chip'; c.dataset.key=key;
+    c.textContent=s.emoji+' '+s.label; c.onclick=()=>makeShape(key);
+    chipHost.appendChild(c);
+  });
+
+  /* ----- 외곽선을 N개의 점으로 균등 재배치 ----- */
+  function resample(pts,N){
+    const P=pts.slice(); P.push(pts[0]); // 닫힌 경로
+    const seg=[]; let total=0;
+    for(let i=1;i<P.length;i++){const l=Math.hypot(P[i][0]-P[i-1][0],P[i][1]-P[i-1][1]);seg.push(l);total+=l;}
+    const out=[]; const step=total/N; let si=0, acc=0;
+    for(let n=0;n<N;n++){
+      const target=n*step;
+      while(si<seg.length-1 && acc+seg[si]<target){acc+=seg[si];si++;}
+      const t=seg[si]===0?0:(target-acc)/seg[si];
+      out.push([P[si][0]+(P[si+1][0]-P[si][0])*t, P[si][1]+(P[si+1][1]-P[si][1])*t]);
+    }
+    return out;
+  }
+  function fit(pts){
+    const r=sky.getBoundingClientRect();
+    const padX=90, padTop=66, padBot=60;
+    let minX=1e9,maxX=-1e9,minY=1e9,maxY=-1e9;
+    pts.forEach(p=>{minX=Math.min(minX,p[0]);maxX=Math.max(maxX,p[0]);minY=Math.min(minY,p[1]);maxY=Math.max(maxY,p[1]);});
+    const w=(maxX-minX)||1, h=(maxY-minY)||1;
+    const s=Math.min((r.width-padX*2)/w,(r.height-padTop-padBot)/h);
+    const offX=(r.width-w*s)/2-minX*s, offY=(r.height-h*s)/2-minY*s+ (padTop-padBot)/2;
+    return pts.map(p=>({x:p[0]*s+offX, y:p[1]*s+offY}));
+  }
+
+  function ensureCount(k){
+    const r=sky.getBoundingClientRect();
+    while(els.length<k){const el=document.createElement('div');el.className='starpt';
+      el.innerHTML='<div class="glow"></div>';
+      el.style.left=(r.width/2)+'px'; el.style.top=(r.height/2)+'px';
+      sky.appendChild(el); els.push(el);}
+    while(els.length>k){els.pop().remove();}
+  }
+
+  function render(){
+    const my=++token;
+    const empty=document.getElementById('skyEmpty');
+    if(entries.length===0){ ensureCount(0); svg.innerHTML=''; empty.style.display='flex'; return; }
+    empty.style.display='none';
+    const r=sky.getBoundingClientRect();
+    let targets;
+    if(shapeKey){
+      const sh=SHAPES[shapeKey];
+      const N=Math.max(entries.length, sh.res);
+      const fitted=fit(resample(sh.pts,N));
+      targets=fitted.map(p=>({x:p.x,y:p.y,label:null,filler:true}));
+      for(let k=0;k<entries.length;k++){
+        const gi=Math.floor(k*N/entries.length);
+        targets[gi].label=entries[k].text; targets[gi].filler=false;
+      }
+    } else {
+      const m=64;
+      targets=entries.map(e=>({x:m+e.fx*(r.width-m*2), y:m+e.fy*(r.height-m*2), label:e.text, filler:false}));
+    }
+    ensureCount(targets.length);
+    targets.forEach((t,i)=>{
+      const el=els[i];
+      el.style.left=t.x+'px'; el.style.top=t.y+'px';
+      el.classList.toggle('filler', t.filler);
+      let inner='<div class="glow"></div>';
+      if(t.label){const side=t.x>r.width/2?'right':'left';
+        inner+=`<div class="lbl" style="${side==='right'?'left:auto;right:24px':''}">${escapeHtml(t.label)}</div>`;}
+      el.innerHTML=inner;
+    });
+    svg.innerHTML='';
+    const draw=()=>{ if(my!==token)return; drawPath(targets, !!shapeKey); };
+    if(shapeKey) setTimeout(draw,720); else draw(); // 모양은 별이 이동한 뒤 선을 그림
+  }
+
+  function drawPath(targets, closed){
+    svg.innerHTML='';
+    const p=targets.map(t=>[t.x,t.y]);
+    const lim= closed? p.length : p.length-1;
+    for(let i=0;i<lim;i++){
+      const a=p[i], b=p[(i+1)%p.length];
+      const l=document.createElementNS('http://www.w3.org/2000/svg','line');
+      l.setAttribute('x1',a[0]);l.setAttribute('y1',a[1]);l.setAttribute('x2',b[0]);l.setAttribute('y2',b[1]);
+      l.setAttribute('stroke','rgba(255,202,40,.6)');l.setAttribute('stroke-width','2');l.setAttribute('stroke-dasharray','4 4');
+      svg.appendChild(l);
+    }
+  }
+
+  function addStar(){
+    const inp=document.getElementById('courageInput');
+    const text=inp.value.trim();
+    if(!text){toast('오늘 용기 낸 일을 적어 주세요 ✍️');return;}
+    entries.push({text, fx:0.08+Math.random()*0.84, fy:0.1+Math.random()*0.8});
+    document.getElementById('cnt3').textContent='모은 용기 별 '+entries.length+'개';
+    addLog(text, entries.length);
+    inp.value=''; inp.focus();
+    render();
+    toast(shapeKey?'✨ 별이 별자리에 합류했어요!':'✨ 별이 떠올랐어요! 용기를 냈군요');
+  }
+  function resolveShape(t){
+    t=t.toLowerCase();
+    for(const key in SHAPES){ if(SHAPES[key].aliases.some(a=>a.toLowerCase()===t)) return key; }
+    return null;
+  }
+  function makeShape(key){
+    if(entries.length<3){toast('별을 3개 이상 모은 뒤 만들 수 있어요 ⭐');return;}
+    if(!SHAPES[key]){toast('하트·별·물고기·집·나무·왕관·달·동그라미 중에서 골라 주세요');return;}
+    shapeKey=key;
+    document.querySelectorAll('#shapeChips .chip').forEach(c=>c.classList.toggle('on', c.dataset.key===key));
+    const tag=document.getElementById('shapeTag');
+    tag.textContent=SHAPES[key].emoji+' '+SHAPES[key].label+' 별자리'; tag.classList.add('show');
+    render();
+    toast('🌟 '+SHAPES[key].label+' 별자리가 완성됐어요!');
+  }
+  function scatter(){
+    shapeKey=null;
+    document.querySelectorAll('#shapeChips .chip').forEach(c=>c.classList.remove('on'));
+    document.getElementById('shapeTag').classList.remove('show');
+    entries.forEach(e=>{e.fx=0.08+Math.random()*0.84; e.fy=0.1+Math.random()*0.8;});
+    render();
+  }
+  function addLog(text,num){
+    const log=document.getElementById('log3');
+    const row=document.createElement('div'); row.className='row';
+    row.innerHTML=`<span class="num">${num}</span><span>${escapeHtml(text)}</span>`;
+    log.prepend(row);
+  }
+
+  document.getElementById('addStar').onclick=addStar;
+  document.getElementById('courageInput').addEventListener('keydown',e=>{if(e.key==='Enter')addStar();});
+  document.getElementById('makeShape').onclick=()=>{
+    const typed=document.getElementById('shapeInput').value.trim();
+    if(typed){const k=resolveShape(typed); if(!k){toast('하트·별·물고기·집·나무·왕관·달·동그라미 중에서 적어 주세요');return;} makeShape(k); document.getElementById('shapeInput').value='';}
+    else if(shapeKey){makeShape(shapeKey);}
+    else {toast('원하는 모양을 고르거나 직접 적어 주세요 ✏️');}
+  };
+  document.getElementById('shapeInput').addEventListener('keydown',e=>{if(e.key==='Enter')document.getElementById('makeShape').click();});
+  document.getElementById('scatterSky').onclick=scatter;
+})();
+</script></body></html>
